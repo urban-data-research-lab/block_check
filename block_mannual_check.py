@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 # block_reviewer_austin_orange_filter.py
 # - Filters giant/line features to avoid huge message payloads
@@ -106,7 +107,7 @@
 # )
 # # ---------------------------------------------------------
 
-from __future__ import annotations
+
 import io
 import os
 from pathlib import Path
@@ -727,5 +728,6 @@ if os.path.exists(WORK_CSV):
     with open(WORK_CSV,"rb") as fh:
         c2.download_button("⬇️ Download decisions CSV", data=fh.read(),
                            file_name=Path(WORK_CSV).name, mime="text/csv")
+
 
 
