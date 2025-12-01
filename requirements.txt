@@ -4,4 +4,5 @@ pandas
 geopandas
 shapely
 rasterio
+requests
 Pillow==10.4.0
