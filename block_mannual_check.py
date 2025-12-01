@@ -106,7 +106,7 @@
 # )
 # # ---------------------------------------------------------
 
-
+from __future__ import annotations
 import io
 import os
 from pathlib import Path
@@ -118,7 +118,7 @@ import rasterio
 from rasterio.io import MemoryFile
 import geopandas as gpd
 import pandas as pd
-from __future__ import annotations
+
 
 # ---------------------------------------------------------
 
@@ -727,4 +727,5 @@ if os.path.exists(WORK_CSV):
     with open(WORK_CSV,"rb") as fh:
         c2.download_button("⬇️ Download decisions CSV", data=fh.read(),
                            file_name=Path(WORK_CSV).name, mime="text/csv")
+
 
