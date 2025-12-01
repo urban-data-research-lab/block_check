@@ -1,7 +1,7 @@
-streamlit==1.37.0
-numpy==1.26.4
-pandas==2.0.3
-geopandas==0.14.4
-shapely==2.0.4
-rasterio==1.4.3
-Pillow<11
+streamlit
+numpy
+pandas
+geopandas
+shapely
+rasterio
+Pillow==10.4.0
