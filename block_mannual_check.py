@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 #!/usr/bin/env python3
 # block_reviewer_austin_orange_filter.py
 # - Filters giant/line features to avoid huge message payloads
@@ -7,24 +8,25 @@ from __future__ import annotations
 # - Windowed raster read + image downscale to keep PNG small
 # - Preserves completion logic & clears A–H for secondary/blank
 
-# import os, io, base64, re
-# from pathlib import Path
-# from collections import Counter
+import os, io, base64, re
+from pathlib import Path
+from collections import Counter
 
-# import numpy as np
-# import pandas as pd
-# import geopandas as gpd
-# from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from PIL import Image, ImageDraw, ImageFont
+import requests
 
-# import rasterio
-# from rasterio.windows import from_bounds, Window
-# from shapely import affinity
-# from shapely.affinity import affine_transform as shp_affine
-# from shapely.geometry import box
+import rasterio
+from rasterio.windows import from_bounds, Window
+from shapely import affinity
+from shapely.affinity import affine_transform as shp_affine
+from shapely.geometry import box
 
-# import streamlit as st
-# from rasterio.io import MemoryFile
-# from urllib.parse import urlparse
+import streamlit as st
+from rasterio.io import MemoryFile
+from urllib.parse import urlparse
 
 
 # ------------------ USER PATHS (Austin) ------------------
@@ -108,17 +110,18 @@ from __future__ import annotations
 # # ---------------------------------------------------------
 
 
-import io
-import os
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode
+# import io
+# import os
+# import re
+# from pathlib import Path
+# from urllib.parse import urlparse, parse_qs, urlencode
 
-import requests          # 记得 requirements.txt 里加一行：requests
-import streamlit as st
-import rasterio
-from rasterio.io import MemoryFile
-import geopandas as gpd
-import pandas as pd
+# import requests          # 记得 requirements.txt 里加一行：requests
+# import streamlit as st
+# import rasterio
+# from rasterio.io import MemoryFile
+# import geopandas as gpd
+# import pandas as pd
 
 
 # ---------------------------------------------------------
@@ -728,6 +731,7 @@ if os.path.exists(WORK_CSV):
     with open(WORK_CSV,"rb") as fh:
         c2.download_button("⬇️ Download decisions CSV", data=fh.read(),
                            file_name=Path(WORK_CSV).name, mime="text/csv")
+
 
 
 
