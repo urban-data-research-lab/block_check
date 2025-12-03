@@ -6,3 +6,4 @@ shapely
 rasterio
 requests
 Pillow==10.4.0
+google-cloud-storage
