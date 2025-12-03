@@ -33,21 +33,75 @@ from google.cloud import storage
 
 _gcs_client = None  # lazy init
 
+# def get_gcs_client():
+#     global _gcs_client
+#     if _gcs_client is not None:
+#         return _gcs_client
+
+#     # 如果 secrets 里有 JSON，就写到 /tmp 并设置 env 变量
+#     if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+#         sa_path = "/tmp/gcp_service_account.json"
+#         with open(sa_path, "w", encoding="utf-8") as f:
+#             f.write(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+#         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+#     # 无论如何尝试初始化（本地可用 ADC，云端用上面的 key）
+#     _gcs_client = storage.Client()
+#     return _gcs_client
+
+
+_gcs_client = None  # lazy init
+
 def get_gcs_client():
+    """
+    使用 Streamlit Secrets 里的 GCP_SERVICE_ACCOUNT_JSON 来初始化 GCS 客户端。
+    如果 secrets 没配好，会在页面上直接报错，而不是抛 DefaultCredentialsError。
+    """
+    import textwrap
+
     global _gcs_client
     if _gcs_client is not None:
         return _gcs_client
 
-    # 如果 secrets 里有 JSON，就写到 /tmp 并设置 env 变量
-    if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-        sa_path = "/tmp/gcp_service_account.json"
-        with open(sa_path, "w", encoding="utf-8") as f:
-            f.write(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+    # 1) 检查 secrets 里面有没有这个 key
+    if "GCP_SERVICE_ACCOUNT_JSON" not in st.secrets:
+        msg = textwrap.dedent(
+            """
+            ❌ 没有在 Streamlit Secrets 中找到 `GCP_SERVICE_ACCOUNT_JSON`。
 
-    # 无论如何尝试初始化（本地可用 ADC，云端用上面的 key）
-    _gcs_client = storage.Client()
+            请到 **Manage app → Settings → Secrets** 里添加类似：
+
+            GCP_SERVICE_ACCOUNT_JSON = \"\"\"{
+              "type": "service_account",
+              "project_id": "block-check-480023",
+              ...
+            }\"\"\"
+            """
+        )
+        st.error(msg)
+        raise RuntimeError("Missing GCP_SERVICE_ACCOUNT_JSON in st.secrets")
+
+    # 2) 把 JSON 内容写到 /tmp 文件里
+    sa_json = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+    sa_path = "/tmp/gcp_service_account.json"
+    with open(sa_path, "w", encoding="utf-8") as f:
+        f.write(sa_json)
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+    # 3) 试着创建 GCS client，如果失败就给出更清楚的提示
+    try:
+        _gcs_client = storage.Client(project="block-check-480023")
+    except Exception as e:
+        st.error(
+            "❌ 创建 GCS Client 失败，请检查 Streamlit Secrets 里的 "
+            "`GCP_SERVICE_ACCOUNT_JSON` 内容是否是完整合法的 service account JSON。\n\n"
+            f"错误信息（已截断）：{str(e)[:500]}"
+        )
+        raise
+
     return _gcs_client
+
 
 def _parse_gcs_path(path: str):
     """
@@ -902,4 +956,5 @@ if os.path.exists(local_dec_path):
             file_name=Path(local_dec_path).name,
             mime="text/csv"
         )
+
 
