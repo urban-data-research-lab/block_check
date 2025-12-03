@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-# block_reviewer_austin_gcs.py
+# block_reviewer_austin_gcs_private.py
 # - Filters giant/line features to avoid huge message payloads
 # - Neighbor borders: blaze orange (solid)
 # - Opaque dark-blue numbers
 # - Windowed raster read + image downscale to keep PNG small
 # - Preserves completion logic & clears A–H for secondary/blank
-# - NEW: optional persistence of decisions CSV to Google Cloud Storage
+#
+# NOTE: This version supports BOTH local paths and PRIVATE GCS paths
+# (gs://... or https://storage.googleapis.com/...) via service account.
 
-import os, io, base64, re
+import os, io, base64, re, json
 from pathlib import Path
 from collections import Counter
 
@@ -23,149 +25,131 @@ from shapely.affinity import affine_transform as shp_affine
 from shapely.geometry import box
 
 import streamlit as st
+from google.cloud import storage
 
-# ---- Optional: sync WORK_CSV with Google Cloud Storage ----
-try:
-    from google.cloud import storage
-    _HAS_GCS = True
-except Exception:
-    _HAS_GCS = False
+# =====================================================
+#                GCS AUTH (SERVICE ACCOUNT)
+# =====================================================
+"""
+在 Streamlit Cloud 的 Secrets 里配置，例如：
 
-def _parse_gcs_url(url: str):
+GCP_SERVICE_ACCOUNT_JSON = """
+{
+  "type": "service_account",
+  "project_id": "...",
+  "private_key_id": "...",
+  "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+  "client_email": "...",
+  "client_id": "...",
+  ...
+}
+"""
+
+本地开发时可以不配，走 gcloud 默认认证；云端必须配。
+"""
+
+_gcs_client = None  # lazy init
+
+def get_gcs_client():
+    global _gcs_client
+    if _gcs_client is not None:
+        return _gcs_client
+
+    # 如果 secrets 里有 JSON，就写到 /tmp 并设置 env 变量
+    if "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+        sa_path = "/tmp/gcp_service_account.json"
+        with open(sa_path, "w", encoding="utf-8") as f:
+            f.write(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+
+    # 无论如何尝试初始化（本地可用 ADC，云端用上面的 key）
+    _gcs_client = storage.Client()
+    return _gcs_client
+
+def _parse_gcs_path(path: str):
     """
-    支持两种形式：
-      - gs://bucket/path/to/file.csv
-      - https://storage.googleapis.com/bucket/path/to/file.csv
-    返回 (bucket_name, blob_name)
+    解析路径：
+    - gs://bucket/path/to/file.ext
+    - https://storage.googleapis.com/bucket/path/to/file.ext
+    - 其他 → 视为本地路径
+    返回：(mode, bucket, blob)
+    mode = "gcs" 或 "local"
     """
-    if not url:
-        return None, None
-    url = url.strip()
+    s = str(path).strip()
+    if s.startswith("gs://"):
+        no_scheme = s[len("gs://"):]
+        bucket, *rest = no_scheme.split("/", 1)
+        blob = rest[0] if rest else ""
+        return "gcs", bucket, blob
 
-    if url.startswith("gs://"):
-        # gs://bucket/path/to/file.csv
-        without_scheme = url[5:]
-        parts = without_scheme.split("/", 1)
-        if len(parts) != 2:
-            return None, None
-        return parts[0], parts[1]
+    if "storage.googleapis.com" in s:
+        # https://storage.googleapis.com/bucket/....../file.ext
+        parts = s.split("storage.googleapis.com/", 1)[-1]
+        bucket, *rest = parts.split("/", 1)
+        blob = rest[0] if rest else ""
+        return "gcs", bucket, blob
 
-    if "storage.googleapis.com" in url:
-        # https://storage.googleapis.com/bucket/path/to/file.csv
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        # parsed.path: /bucket/path/to/file.csv
-        path = parsed.path.lstrip("/")
-        parts = path.split("/", 1)
-        if len(parts) != 2:
-            return None, None
-        return parts[0], parts[1]
+    return "local", None, None
 
-    return None, None
+# 在 session_state 里为 GCS 下载做一个缓存，避免每次都重新拉 8GB TIF
+if "gcs_local_cache" not in st.session_state:
+    st.session_state.gcs_local_cache = {}
 
-def download_work_csv_from_gcs(gcs_url: str, local_path: str):
-    """如果配置了 gcs_url，就从 GCS 下载到 local_path（覆盖本地旧文件）。"""
-    if not (_HAS_GCS and gcs_url):
+def ensure_local_file(path: str, kind: str) -> str:
+    """
+    如果 path 是 GCS（gs:// 或 https://storage.googleapis.com/...）：
+      - 用 service account 从 GCS 下载到 /tmp 下（带 kind 前缀）
+      - 返回本地路径
+    如果 path 是普通本地路径：
+      - 原样返回
+    """
+    mode, bucket, blob = _parse_gcs_path(path)
+    if mode == "local":
+        return path
+
+    if not bucket or not blob:
+        raise ValueError(f"Invalid GCS path: {path}")
+
+    cache_key = f"{bucket}/{blob}"
+    cache = st.session_state.gcs_local_cache
+    if cache_key in cache and os.path.exists(cache[cache_key]):
+        return cache[cache_key]
+
+    client = get_gcs_client()
+    bucket_obj = client.bucket(bucket)
+    blob_obj = bucket_obj.blob(blob)
+
+    ext = Path(blob).suffix or ".dat"
+    local_path = f"/tmp/{kind}_{Path(blob).stem}{ext}"
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    blob_obj.download_to_filename(local_path)
+
+    cache[cache_key] = local_path
+    st.session_state.gcs_local_cache = cache
+    return local_path
+
+def upload_local_to_gcs(local_path: str, dest_path: str):
+    """
+    把本地文件上传回 GCS（dest_path 可以是 gs://... 或 https://storage.googleapis.com/...）
+    如果 dest_path 看起来是本地路径，则不上传。
+    """
+    mode, bucket, blob = _parse_gcs_path(dest_path)
+    if mode != "gcs":
+        # 视为本地路径：简单复制/移动
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        os.replace(local_path, dest_path)
         return
 
-    bucket_name, blob_name = _parse_gcs_url(gcs_url)
-    if not bucket_name:
-        st.warning(f"⚠️ GCS URL looks invalid: {gcs_url}")
-        return
+    client = get_gcs_client()
+    bucket_obj = client.bucket(bucket)
+    blob_obj = bucket_obj.blob(blob)
+    blob_obj.upload_from_filename(local_path)
 
-    try:
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        if not blob.exists():
-            # 第一次还没上传过，不报错
-            return
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        blob.download_to_filename(local_path)
-        st.info(f"📥 Loaded decisions from GCS: {gcs_url}")
-    except Exception as e:
-        st.warning(f"⚠️ Failed to download WORK_CSV from GCS: {e}")
+# =====================================================
+#                 STREAMLIT BASIC CONFIG
+# =====================================================
+st.set_page_config(layout="wide", page_title="Block Review – Austin (GCS private)")
 
-def upload_work_csv_to_gcs(gcs_url: str, local_path: str):
-    """把本地 WORK_CSV 上传到 GCS，作为备份 / 持久化。"""
-    if not (_HAS_GCS and gcs_url):
-        return
-
-    bucket_name, blob_name = _parse_gcs_url(gcs_url)
-    if not bucket_name:
-        st.warning(f"⚠️ GCS URL looks invalid: {gcs_url}")
-        return
-
-    try:
-        client = storage.Client()
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.upload_from_filename(local_path)
-        st.toast("☁️ Synced decisions to GCS")
-    except Exception as e:
-        st.warning(f"⚠️ Failed to upload WORK_CSV to GCS: {e}")
-
-
-# ------------------ PAGE CONFIG ------------------
-st.set_page_config(layout="wide", page_title="Block Review – Austin (GCS-enabled)")
-
-# ------------------ SIDEBAR INPUTS ------------------
-st.sidebar.header("📁 Inputs (GCS URL or local path)")
-
-raster_path = st.sidebar.text_input(
-    "Raster (.tif) GCS URL or local path",
-    value=st.session_state.get("raster_path", "")
-)
-vector_path = st.sidebar.text_input(
-    "Vector (.geojson) GCS URL or local path",
-    value=st.session_state.get("vector_path", "")
-)
-ocr_csv_path = st.sidebar.text_input(
-    "OCR CSV GCS URL or local path",
-    value=st.session_state.get("ocr_csv_path", "")
-)
-
-st.sidebar.markdown("---")
-gcs_work_url = st.sidebar.text_input(
-    "Optional: GCS URL for decisions CSV (gs://... or https://storage.googleapis.com/...)",
-    value=st.session_state.get("gcs_work_url", "")
-)
-st.sidebar.caption("若配置此项，则决策 CSV 会与 GCS 同步，防止容器重启后丢失。")
-
-# 把输入记到 session_state，避免重跑后丢失
-st.session_state["raster_path"]  = raster_path
-st.session_state["vector_path"]  = vector_path
-st.session_state["ocr_csv_path"] = ocr_csv_path
-st.session_state["gcs_work_url"] = gcs_work_url
-
-# simple check：所有必须输入不能为空
-if not (raster_path and vector_path and ocr_csv_path):
-    st.warning("👈 请在左侧填写 Raster / Vector / OCR CSV 的路径/URL。")
-    st.stop()
-
-RASTER_PATH  = raster_path
-VECTOR_PATH  = vector_path
-OCR_CSV_PATH = ocr_csv_path
-
-# 输出目录固定在当前仓库下的 outputs（避免用户填 C:/... 这种无效路径）
-BASE_DIR  = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-WORK_CSV_PATH = OUTPUT_DIR / (Path(str(OCR_CSV_PATH)).stem + "__ui_work.csv")
-WORK_CSV = str(WORK_CSV_PATH)
-
-# ----------- FILTER / SIZE LIMIT KNOBS -----------
-EXCLUDE_TERMS = ["red_line", "redline", "red crayon", "redcrayon"]
-MAX_POLY_AREA_PX2 = 5_000_000
-MAX_WINDOW_PIXELS = 2_800_000   # ~ (1680 x 1670)
-
-FIELDS = list("abcdefgh")
-CLASS_OPTIONS  = ["primary","secondary","blank","multiple","obscured"]
-
-DEFAULT_PIXEL_BUFFER = 25
-BUFFER_STEP = 100
-
-# ---------- PAGE STYLE ----------
 st.markdown("""
 <style>
   main .block-container { padding-top:.35rem; padding-bottom:.35rem; }
@@ -178,14 +162,71 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- helpers ----------
+# =====================================================
+#                 SIDEBAR: PATH CONFIG
+# =====================================================
+st.sidebar.header("📁 Input / Output paths")
+
+raster_path = st.sidebar.text_input(
+    "Raster (.tif) path (local or gs:// or https://storage.googleapis.com/...)",
+    value=st.session_state.get("raster_path", "")
+)
+vector_path = st.sidebar.text_input(
+    "Vector (.geojson) path (local or gs:// or https://storage.googleapis.com/...)",
+    value=st.session_state.get("vector_path", "")
+)
+ocr_csv_path = st.sidebar.text_input(
+    "OCR CSV path (local or gs:// or https://storage.googleapis.com/...)",
+    value=st.session_state.get("ocr_csv_path", "")
+)
+# 可选：本地输出目录（只在你本机运行时有意义；云端重启会丢）
+output_dir = st.sidebar.text_input(
+    "Optional local output directory (for debugging; e.g. ./outputs)",
+    value=st.session_state.get("output_dir", "./outputs")
+)
+decisions_gcs_url = st.sidebar.text_input(
+    "Decisions CSV (gs://... or https://storage.googleapis.com/...) [recommended]",
+    value=st.session_state.get("decisions_gcs_url", "")
+)
+
+st.session_state["raster_path"] = raster_path
+st.session_state["vector_path"] = vector_path
+st.session_state["ocr_csv_path"] = ocr_csv_path
+st.session_state["output_dir"]   = output_dir
+st.session_state["decisions_gcs_url"] = decisions_gcs_url
+
+# simple check：all core paths have to be non-null
+if not (raster_path and vector_path and ocr_csv_path):
+    st.warning("👈 Please fill in Raster, Vector and OCR CSV paths (local or GCS) in the left sidebar before continuing.")
+    st.stop()
+
+RASTER_PATH  = raster_path
+VECTOR_PATH  = vector_path
+OCR_CSV_PATH = ocr_csv_path
+OUTPUT_DIR   = output_dir
+# 本地临时 decisions CSV（用来 download_button）
+LOCAL_DECISIONS_TMP = "/tmp/decisions_ui_work.csv"
+
+# =====================================================
+#           FILTER / SIZE LIMIT KNOBS & CONSTANTS
+# =====================================================
+EXCLUDE_TERMS = ["red_line", "redline", "red crayon", "redcrayon"]
+
+MAX_POLY_AREA_PX2 = 5_000_000
+MAX_WINDOW_PIXELS = 2_800_000   # ~ (1680 x 1670)
+
+FIELDS = list("abcdefgh")
+CLASS_OPTIONS  = ["primary","secondary","blank","multiple","obscured"]
+
+DEFAULT_PIXEL_BUFFER = 25
+BUFFER_STEP = 100
+
+# =====================================================
+#                      HELPERS
+# =====================================================
 def load_font(px):
-    for p in [
-        "C:/Windows/Fonts/arial.ttf",
-        "C:/Windows/Fonts/calibri.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/Library/Fonts/Arial.ttf"
-    ]:
+    for p in ["C:/Windows/Fonts/arial.ttf","C:/Windows/Fonts/calibri.ttf",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf","/Library/Fonts/Arial.ttf"]:
         if os.path.exists(p):
             try:
                 return ImageFont.truetype(p, px)
@@ -198,9 +239,9 @@ def pick_font(img_w, img_h, min_px=18, max_px=56, frac=0.055):
     return load_font(px)
 
 # Colors
-BLUE_NUM = (0, 60, 170, 255)
-ORANGE   = (255, 120, 0, 255)
-RED_EDGE = (255, 0, 0, 255)
+BLUE_NUM = (0, 60, 170, 255)      # dark, opaque blue numbers
+ORANGE  = (255, 120, 0, 255)      # blaze orange neighbor borders
+RED_EDGE = (255, 0, 0, 255)       # focus outline
 
 def scale_to_uint8(arr):
     arr = arr.astype(np.float32, copy=False)
@@ -239,7 +280,7 @@ def draw_centered_text(draw: ImageDraw.ImageDraw, txt: str, center_xy, font, fil
     y = int(center_xy[1] - h/2)
     draw.text((x,y), txt, fill=fill_rgba, font=font)
 
-def digits_only(x):
+def digits_only(x): 
     return re.sub(r"\D", "", str(x) if x is not None else "")
 
 def majority_len(series):
@@ -331,20 +372,16 @@ def clamp_image_if_needed(img: Image.Image, max_pixels=MAX_WINDOW_PIXELS) -> Ima
     new_h = max(1, int(h*scale))
     return img.resize((new_w, new_h), Image.BILINEAR)
 
-# ---------- load raster & vector ----------
-gdal_opts = {
-    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff,.TIF,.TIFF"
-}
-
-with rasterio.Env(**gdal_opts):
-    src = rasterio.open(RASTER_PATH)
-
+# =====================================================
+#              LOAD RASTER & VECTOR (WITH GCS)
+# =====================================================
+local_raster_path = ensure_local_file(RASTER_PATH, kind="raster")
+src = rasterio.open(local_raster_path)
 A   = src.transform
 A_params = (A.a, A.b, A.d, A.e, A.c, A.f)
 
-# GeoJSON 支持 URL / 本地路径
-gdf0 = gpd.read_file(VECTOR_PATH)
+local_vector_path = ensure_local_file(VECTOR_PATH, kind="vector")
+gdf0 = gpd.read_file(local_vector_path)
 
 # choose an ID column
 for candidate in ["global_id","id","ID","OBJECTID","fid","fidc","block_id"]:
@@ -366,13 +403,9 @@ def is_pixel_space(gdf, raster):
 # Normalize geometries to raster CRS
 if is_pixel_space(gdf0, src):
     gdf_px = gdf0.copy()
-    gdf_px["geometry"] = gdf_px["geometry"].map(
-        lambda g: affinity.scale(g, yfact=-1, origin=(0,0)) if g is not None else None
-    )
+    gdf_px["geometry"] = gdf_px["geometry"].map(lambda g: affinity.scale(g, yfact=-1, origin=(0,0)) if g is not None else None)
     gdf_map = gdf_px.copy()
-    gdf_map["geometry"] = gdf_px["geometry"].map(
-        lambda g: shp_affine(g, A_params) if g is not None else None
-    )
+    gdf_map["geometry"] = gdf_px["geometry"].map(lambda g: shp_affine(g, A_params) if g is not None else None)
     gdf_map.set_crs(src.crs, inplace=True)
 else:
     gdf_map = gdf0.copy()
@@ -424,8 +457,11 @@ target_len = majority_len(gdf_map[id_field].astype(str).map(digits_only)) or 12
 gdf_map["id_norm"] = gdf_map[id_field].astype(str).map(lambda s: norm_zfill(s, target_len))
 IDNORM_TO_REAL = dict(zip(gdf_map["id_norm"], gdf_map[id_field].astype(str)))
 
-# ---------- OCR / seeds ----------
-ocr_df = pd.read_csv(OCR_CSV_PATH, dtype=str, low_memory=False).fillna("")
+# =====================================================
+#                 OCR / SEEDS (WITH GCS)
+# =====================================================
+local_ocr_path = ensure_local_file(OCR_CSV_PATH, kind="ocr")
+ocr_df = pd.read_csv(local_ocr_path, dtype=str, low_memory=False).fillna("")
 if "id" not in ocr_df.columns:
     st.error("OCR CSV must have an 'id' column.")
     st.stop()
@@ -439,26 +475,55 @@ def seed_for(fid_norm: str):
     raw = {f: r.get(f,"") for f in FIELDS}
     return clean_fields(raw)
 
-# ---------- decisions ----------
+# =====================================================
+#                    DECISIONS
+# =====================================================
 DECISION_COLS = [
     "id","class","a","b","c","d","e","f","g","h","comment",
     "secondary_ids","blank_neighbor_ids","primary_for_secondary","completed"
 ]
 
-# 启动时先尝试从 GCS 下载最新的 WORK_CSV
-download_work_csv_from_gcs(gcs_work_url, WORK_CSV)
+def load_decisions_initial():
+    """
+    优先：从 decisions_gcs_url（GCS 私有）下载；
+    若没填，则尝试从本地 OUTPUT_DIR 中读；
+    若都没有，则返回空 DataFrame。
+    """
+    dec_cfg = st.session_state.get("decisions_gcs_url", "").strip()
+    if dec_cfg:
+        try:
+            local_dec = ensure_local_file(dec_cfg, kind="decisions")
+            if os.path.exists(local_dec):
+                df = pd.read_csv(local_dec, dtype=str).reindex(columns=DECISION_COLS, fill_value="")
+                # 缓存一份路径给 download_button 用
+                st.session_state["decisions_local_path"] = local_dec
+                return df
+        except Exception as e:
+            st.warning(f"Could not load decisions from GCS ({dec_cfg}): {e}")
 
-if os.path.exists(WORK_CSV):
-    decisions = pd.read_csv(WORK_CSV, dtype=str).reindex(columns=DECISION_COLS, fill_value="")
-else:
-    decisions = pd.DataFrame(columns=DECISION_COLS)
+    # fallback: local WORK_CSV (for local debugging)
+    work_csv_local = os.path.join(OUTPUT_DIR, Path(OCR_CSV_PATH).stem + "__ui_work.csv")
+    if os.path.exists(work_csv_local):
+        df = pd.read_csv(work_csv_local, dtype=str).reindex(columns=DECISION_COLS, fill_value="")
+        st.session_state["decisions_local_path"] = work_csv_local
+        return df
+
+    st.session_state["decisions_local_path"] = LOCAL_DECISIONS_TMP
+    return pd.DataFrame(columns=DECISION_COLS)
+
+decisions = load_decisions_initial()
 
 def ensure_row_exists(d_id):
     m = decisions["id"] == str(d_id)
     if not m.any():
         base = {
-            "id": str(d_id), "class":"primary", "comment":"", "secondary_ids":"",
-            "blank_neighbor_ids":"", "primary_for_secondary":"", "completed":"false"
+            "id": str(d_id),
+            "class": "primary",
+            "comment": "",
+            "secondary_ids": "",
+            "blank_neighbor_ids": "",
+            "primary_for_secondary": "",
+            "completed": "false"
         }
         base.update({k:"" for k in FIELDS})
         decisions.loc[len(decisions)] = base
@@ -470,17 +535,43 @@ def get_decision(fid):
         return decisions.loc[m].iloc[0].copy()
     s = seed_for(norm_zfill(fid, target_len))
     row = {
-        "id":fid, "class":"primary", **s, "comment":"",
-        "secondary_ids":"", "blank_neighbor_ids":"",
-        "primary_for_secondary":"", "completed":"false"
+        "id": fid,
+        "class": "primary",
+        **s,
+        "comment": "",
+        "secondary_ids": "",
+        "blank_neighbor_ids": "",
+        "primary_for_secondary": "",
+        "completed": "false"
     }
     decisions.loc[len(decisions)] = row
     return decisions.loc[decisions["id"]==fid].iloc[0].copy()
 
 def save_decisions():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    decisions.reindex(columns=DECISION_COLS, fill_value="").to_csv(WORK_CSV, index=False)
-    upload_work_csv_to_gcs(gcs_work_url, WORK_CSV)
+    """
+    核心策略：
+    1. 总是写一份到 /tmp/decisions_ui_work.csv
+    2. 如果用户填了 decisions_gcs_url，则上传到 GCS（private）
+    3. 本地调试时，也写到 OUTPUT_DIR 下的 __ui_work.csv
+    """
+    os.makedirs(os.path.dirname(LOCAL_DECISIONS_TMP), exist_ok=True)
+    decisions.reindex(columns=DECISION_COLS, fill_value="").to_csv(LOCAL_DECISIONS_TMP, index=False)
+    st.session_state["decisions_local_path"] = LOCAL_DECISIONS_TMP
+
+    dec_dest = st.session_state.get("decisions_gcs_url", "").strip()
+    if dec_dest:
+        try:
+            upload_local_to_gcs(LOCAL_DECISIONS_TMP, dec_dest)
+        except Exception as e:
+            st.warning(f"Failed to upload decisions to GCS ({dec_dest}): {e}")
+
+    # optional: local copy for debugging
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        work_csv_local = os.path.join(OUTPUT_DIR, Path(OCR_CSV_PATH).stem + "__ui_work.csv")
+        decisions.reindex(columns=DECISION_COLS, fill_value="").to_csv(work_csv_local, index=False)
+    except Exception:
+        pass
 
 def compute_completed(df):
     done = set(df.loc[df["completed"].astype(str).str.lower().eq("true"), "id"].astype(str))
@@ -506,7 +597,9 @@ def resolve_token_to_real_id(token: str, neigh_map: dict):
         return str(IDNORM_TO_REAL[norm])
     return token
 
-# ------- renderer (windowed) -------
+# =====================================================
+#                  RENDERER (WINDOWED)
+# =====================================================
 if "clip_cache" not in st.session_state:
     st.session_state.clip_cache = {}
 
@@ -551,13 +644,13 @@ def render_window_b64(fid: str, feat_map_geom, buffer_px: int):
     Tinv = ~out_transform
     Tinv_params = (Tinv.a, Tinv.b, Tinv.d, Tinv.e, Tinv.c, Tinv.f)
 
-    # focus outline
+    # outline focus (solid red)
     focus_px = shp_affine(feat_map_geom, Tinv_params)
     f_polys = list(focus_px.geoms) if getattr(focus_px, "geom_type","")=="MultiPolygon" else [focus_px]
     for p in f_polys:
         draw.line(list(p.exterior.coords), fill=RED_EDGE, width=3, joint="curve")
 
-    # neighbors
+    # neighbors: blaze orange border + dark blue numbers (opaque)
     current_norm = norm_zfill(fid, target_len)
     neigh_df = neighbors_in_buffer(feat_map_geom, buffer_px, current_norm)
     neigh_map = {}
@@ -581,7 +674,9 @@ def render_window_b64(fid: str, feat_map_geom, buffer_px: int):
     st.session_state.clip_cache = cache
     return b64, Tinv_params, neigh_map
 
-# -------------- session/nav --------------
+# =====================================================
+#            SESSION / NAVIGATION STATE
+# =====================================================
 if "idx" not in st.session_state:
     st.session_state.idx = 0
 if "initialized" not in st.session_state:
@@ -624,7 +719,9 @@ def goto_index(new_idx):
     st.session_state.idx = new_idx % len(gdf_map)
     st.session_state.buffer_px = DEFAULT_PIXEL_BUFFER
 
-# ----------------- UI -----------------
+# =====================================================
+#                       UI
+# =====================================================
 done_count = len(compute_completed(decisions))
 st.markdown(f"**Progress:** {done_count} / {len(gdf_map)}")
 st.progress(min(1.0, done_count/max(1,len(gdf_map))))
@@ -632,10 +729,7 @@ st.progress(min(1.0, done_count/max(1,len(gdf_map))))
 left, right = st.columns([1.65, 1.35], gap="small")
 
 with left:
-    st.markdown(
-        "On-the-fly Clip <span style='color:#888;'>(red current • blaze-orange neighbors)</span>",
-        unsafe_allow_html=True
-    )
+    st.markdown("On-the-fly Clip <span style='color:#888;'>(red current • blaze-orange neighbors)</span>", unsafe_allow_html=True)
     if len(gdf_map) == 0:
         st.error("No polygons after filtering. Try relaxing filters or thresholds.")
         st.stop()
@@ -655,9 +749,7 @@ with left:
         st.session_state.last_fid = fid
 
     try:
-        b64, Tinv_params, neigh_map = render_window_b64(
-            fid, feat_row.geometry, st.session_state.buffer_px
-        )
+        b64, Tinv_params, neigh_map = render_window_b64(fid, feat_row.geometry, st.session_state.buffer_px)
     except ValueError as e:
         st.warning(f"{e} — marking as skipped & advancing.")
         ensure_row_exists(fid)
@@ -675,10 +767,7 @@ with left:
     if z2.button("+ Buffer", use_container_width=True):
         st.session_state.buffer_px = st.session_state.buffer_px + BUFFER_STEP
         st.rerun()
-    z3.markdown(
-        f'<span class="badge">buffer: {st.session_state.buffer_px}px</span>',
-        unsafe_allow_html=True
-    )
+    z3.markdown(f'<span class="badge">buffer: {st.session_state.buffer_px}px</span>', unsafe_allow_html=True)
 
     st.markdown("---")
     n1, n2, n3 = st.columns(3)
@@ -711,9 +800,9 @@ with right:
     with st.form(f"edit_form_{fid}", clear_on_submit=False):
         comment_val = row.get("comment","")
         a_val,b_val,c_val,d_val,e_val,f_val,g_val,h_val = [row.get(k,"") for k in "abcdefgh"]
-        sec_text   = row.get("secondary_ids","")
+        sec_text = row.get("secondary_ids","")
         blank_text = row.get("blank_neighbor_ids","")
-        prim_text  = row.get("primary_for_secondary","")
+        prim_text = row.get("primary_for_secondary","")
 
         if sel_class == "primary":
             st.markdown("### Fields (A–H)")
@@ -727,14 +816,8 @@ with right:
             h_val = st.text_input("H (%)",    h_val)
 
             st.markdown("### Linked blocks (optional)")
-            sec_text   = st.text_input(
-                "Secondary blocks (blue numbers or real IDs; spaces/commas)",
-                value=sec_text
-            )
-            blank_text = st.text_input(
-                "Blank blocks (blue numbers or real IDs; spaces/commas)",
-                value=blank_text
-            )
+            sec_text   = st.text_input("Secondary blocks (blue numbers or real IDs; spaces/commas)", value=sec_text)
+            blank_text = st.text_input("Blank blocks (blue numbers or real IDs; spaces/commas)",    value=blank_text)
             comment_val = st.text_area("Comment", comment_val, height=76)
 
         elif sel_class == "secondary":
@@ -745,10 +828,7 @@ with right:
         else:  # blank / multiple / obscured
             st.info("A–H hidden for this classification.")
             if sel_class == "blank":
-                blank_text = st.text_input(
-                    "Additional blank blocks (blue numbers or real IDs; optional)",
-                    value=blank_text
-                )
+                blank_text = st.text_input("Additional blank blocks (blue numbers or real IDs; optional)", value=blank_text)
             comment_val = st.text_area("Comment", comment_val, height=76)
 
         submitted = st.form_submit_button("✅ Save & Next (Enter)")
@@ -758,13 +838,8 @@ with right:
         decisions.loc[decisions["id"]==fid, ["class","comment"]] = [sel_class, comment_val]
 
         if sel_class == "primary":
-            cleaned = clean_fields({
-                "a":a_val,"b":b_val,"c":c_val,"d":d_val,
-                "e":e_val,"f":f_val,"g":g_val,"h":h_val
-            })
-            decisions.loc[decisions["id"]==fid, list("abcdefgh")] = [
-                cleaned[k] for k in list("abcdefgh")
-            ]
+            cleaned = clean_fields({"a":a_val,"b":b_val,"c":c_val,"d":d_val,"e":e_val,"f":f_val,"g":g_val,"h":h_val})
+            decisions.loc[decisions["id"]==fid, list("abcdefgh")] = [cleaned[k] for k in list("abcdefgh")]
 
             sec_list   = [resolve_token_to_real_id(t, neigh_map) for t in parse_block_list(sec_text)]
             blank_list = [resolve_token_to_real_id(t, neigh_map) for t in parse_block_list(blank_text)]
@@ -833,11 +908,14 @@ c1, c2 = st.columns(2)
 if c1.button("💾 Save Now"):
     save_decisions()
     st.toast("Saved.")
-if os.path.exists(WORK_CSV):
-    with open(WORK_CSV,"rb") as fh:
+
+# download_button：永远从本地临时文件导出，不依赖 GCS 公网
+local_dec_path = st.session_state.get("decisions_local_path", LOCAL_DECISIONS_TMP)
+if os.path.exists(local_dec_path):
+    with open(local_dec_path, "rb") as fh:
         c2.download_button(
             "⬇️ Download decisions CSV",
             data=fh.read(),
-            file_name=WORK_CSV_PATH.name,
+            file_name=Path(local_dec_path).name,
             mime="text/csv"
         )
