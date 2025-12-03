@@ -30,23 +30,6 @@ from google.cloud import storage
 # =====================================================
 #                GCS AUTH (SERVICE ACCOUNT)
 # =====================================================
-"""
-在 Streamlit Cloud 的 Secrets 里配置，例如：
-
-GCP_SERVICE_ACCOUNT_JSON = """
-{
-  "type": "service_account",
-  "project_id": "...",
-  "private_key_id": "...",
-  "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
-  "client_email": "...",
-  "client_id": "...",
-  ...
-}
-"""
-
-本地开发时可以不配，走 gcloud 默认认证；云端必须配。
-"""
 
 _gcs_client = None  # lazy init
 
@@ -919,3 +902,4 @@ if os.path.exists(local_dec_path):
             file_name=Path(local_dec_path).name,
             mime="text/csv"
         )
+
